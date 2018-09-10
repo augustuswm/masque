@@ -1,13 +1,17 @@
 extern crate base64;
 #[macro_use]
 extern crate log;
+extern crate futures;
 extern crate hyper;
+extern crate hyper_tls;
 
 use base64::encode;
+use futures::future::{loop_fn, Loop};
 use hyper::header::{HeaderValue, ACCEPT, AUTHORIZATION};
 use hyper::rt::{self, Future, Stream};
 use hyper::service::service_fn_ok;
 use hyper::{Body, Client, Method, Request, Response, Server};
+use hyper_tls::HttpsConnector;
 
 use event::{Event, EventBuilder, EventLineResponse};
 use store::Store;
@@ -61,8 +65,8 @@ struct StreamReq<'a, 'b, 'c, 'd, 'e> {
 }
 
 impl<'a, 'b, 'c, 'd, 'e> StreamReq<'a, 'b, 'c, 'd, 'e> {
-    pub fn as_request(self) -> Result<Request<Body>, error::MasqueError> {
-        let url = "http://".to_string() + self.host.unwrap_or("localhost") + ":"
+    pub fn as_request(&self) -> Result<Request<Body>, error::MasqueError> {
+        let url = "https://".to_string() + self.host.unwrap_or("localhost") + ":"
             + self.port.unwrap_or(8088).to_string().as_str() + "/api/v1/stream/"
             + self.app + "/" + self.env + "/";
 
@@ -80,59 +84,63 @@ impl<'a, 'b, 'c, 'd, 'e> StreamReq<'a, 'b, 'c, 'd, 'e> {
     }
 }
 
-fn main() -> Result<(), error::MasqueError> {
+fn request(store: Store<String>) -> impl Future<Item = Loop<(), Store<String>>, Error = ()> {
     let r = StreamReq {
         app: "test_app",
         env: "test_env",
         key: "dev",
         secret: "dev",
-        host: Some("localhost"),
-        port: Some(8088),
+        host: Some("www.masquerade.io"),
+        port: Some(443),
     };
 
-    let req = r.as_request()?;
-
     let mut h = StreamHandler::new();
+
+    let https = HttpsConnector::new(4).expect("TLS initialization failed");
+    let client = Client::builder().build::<_, hyper::Body>(https);
+
+    let s_ok = store.clone();
+    let s_err = store.clone();
+
+    client
+        .request(r.as_request().unwrap())
+        .and_then(move |res| {
+            println!("Response: {}", res.status());
+            println!("Headers: {:#?}", res.headers());
+            res.into_body().for_each(move |chunk| {
+                let _written = ::std::str::from_utf8(&*chunk)
+                    .map_err(|e| e.into())
+                    .and_then(|data| {
+                        let lines = data.split("\n").collect::<Vec<&str>>();
+
+                        match h.read(lines) {
+                            EventStreamResponse::Incomplete => Ok(()),
+                            EventStreamResponse::Complete(event) => {
+                                println!("Stored {:?}", event);
+                                store.update(event.data()).and_then(|_| Ok(()))
+                            }
+                        }
+                    })
+                    .or_else(|e| {
+                        error!("Error handling incoming data: {}", e);
+                        Err(e)
+                    });
+
+                Ok(())
+            })
+        })
+        .and_then(|_| {
+            Ok(Loop::Continue(s_ok))
+        })
+        .or_else(|_err| {
+            Ok(Loop::Continue(s_err))
+        })
+}
+
+fn main() -> Result<(), error::MasqueError> {
     let s: Store<String> = Store::new("");
 
-    let s_p = s.clone();
-    let proxy = rt::lazy(move || {
-        let client = Client::new();
-
-        client
-            .request(req)
-            .and_then(move |res| {
-                println!("Response: {}", res.status());
-                println!("Headers: {:#?}", res.headers());
-                res.into_body().for_each(move |chunk| {
-                    let _written = ::std::str::from_utf8(&*chunk)
-                        .map_err(|e| e.into())
-                        .and_then(|data| {
-                            let lines = data.split("\n").collect::<Vec<&str>>();
-
-                            match h.read(lines) {
-                                EventStreamResponse::Incomplete => Ok(()),
-                                EventStreamResponse::Complete(event) => {
-                                    print!("Stored {:?}", event);
-                                    s_p.update(event.data()).and_then(|_| Ok(()))
-                                }
-                            }
-                        })
-                        .or_else(|e| {
-                            error!("Error handling incoming data: {}", e);
-                            Err(e)
-                        });
-
-                    Ok(())
-                })
-            })
-            .map(|_| {
-                println!("\n\nDone.");
-            })
-            .map_err(|err| {
-                eprintln!("Error {}", err);
-            })
-    });
+    let proxy = loop_fn(s.clone(), request);
 
     let new_service = move || {
         let s_r = s.clone();
